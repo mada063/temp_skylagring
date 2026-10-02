@@ -1,0 +1,57 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  @apply bg-bg text-fg antialiased;
+}
+
+/* Thin, flat scrollbars to match the minimal aesthetic. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #3c4247 transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #3c4247;
+  border-radius: 0;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #4a5157;
+  background-clip: content-box;
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 px-3.5 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn bg-accent text-accent-fg hover:bg-accent/90;
+  }
+  .btn-ghost {
+    @apply btn text-muted hover:bg-elevated hover:text-fg;
+  }
+  .btn-surface {
+    @apply btn border border-border bg-surface text-fg hover:bg-elevated;
+  }
+  .input {
+    @apply w-full border border-border bg-surface px-3 py-2 text-sm text-fg placeholder:text-muted outline-none focus:border-accent;
+  }
+  .card {
+    @apply border border-border bg-surface;
+  }
+}

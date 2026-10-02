@@ -1,0 +1,78 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String?
+  passwordHash String
+  image        String? // data URL for the profile picture
+  maxUploadMb       Int @default(10240) // per-file upload size limit (MB), default 10 GB
+  uploadConcurrency Int @default(8) // parallel uploads when dropping many files
+  scanConcurrency   Int @default(32) // parallel workers while reading a dropped folder
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  folders Folder[]
+  files   File[]
+}
+
+model Folder {
+  id        String    @id @default(cuid())
+  name      String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime? // soft-delete → trash; purged after 30 days
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  parentId String?
+  parent   Folder?  @relation("FolderChildren", fields: [parentId], references: [id], onDelete: Cascade)
+  children Folder[] @relation("FolderChildren")
+
+  files File[]
+
+  // Uniqueness of live folders is enforced by a partial unique index
+  // (see prisma/sql/folder_unique.sql).
+  @@index([userId])
+  @@index([parentId])
+  @@index([userId, parentId, name])
+  @@index([deletedAt])
+}
+
+model File {
+  id        String    @id @default(cuid())
+  name      String
+  mimeType  String
+  size      BigInt
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime? // soft-delete → trash; purged after 30 days
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  folderId String?
+  folder   Folder?   @relation(fields: [folderId], references: [id], onDelete: Cascade)
+  data     FileData?
+
+  @@index([userId])
+  @@index([folderId])
+  @@index([name])
+  @@index([deletedAt])
+}
+
+// File bytes stored separately so listing metadata stays cheap.
+model FileData {
+  id     String @id @default(cuid())
+  bytes  Bytes
+  fileId String @unique
+  file   File   @relation(fields: [fileId], references: [id], onDelete: Cascade)
+}
