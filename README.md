@@ -4,8 +4,6 @@ A simple, flat cloud-storage app built with **Next.js (App Router)**, **Prisma**
 **PostgreSQL**. Files are stored as bytes directly in Postgres, so the database is the
 only piece of infrastructure you need.
 
-Design inspired by [dallastek.no](https://dallastek.no): flat, minimal, dark, no gradients.
-
 ## Features
 
 - **Email + password auth** — bcrypt-hashed passwords, JWT session cookies, route protection via middleware.
