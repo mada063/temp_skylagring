@@ -1,0 +1,13 @@
+node_modules
+.next
+.git
+.gitignore
+uploads
+*.md
+.env
+.env.*
+!.env.example
+tsconfig.tsbuildinfo
+Dockerfile
+docker-compose.yml
+.dockerignore

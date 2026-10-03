@@ -33,22 +33,41 @@ Design inspired by [dallastek.no](https://dallastek.no): flat, minimal, dark, no
 
 ## Getting started
 
-### 1. Start PostgreSQL
+### Docker (app + Postgres)
 
-With Docker (easiest):
+Works on a Proxmox LXC if nesting is enabled on the CT
+(`features: nesting=1,keyctl=1` in `/etc/pve/lxc/<CTID>.conf`).
 
 ```bash
-docker compose up -d
+cp .env.example .env
+# set AUTH_SECRET (openssl rand -base64 32) and optionally POSTGRES_PASSWORD / PORT
+docker compose up -d --build
+```
+
+Open http://localhost:3000 (or your LXC IP on the mapped port).
+Schema is applied automatically on container start; uploads persist in the
+`skylagring-uploads` volume.
+
+### Local development
+
+#### 1. Start PostgreSQL
+
+```bash
+docker compose up -d db
 ```
 
 …or point `DATABASE_URL` at any existing Postgres instance.
 
-### 2. Configure environment
-
-Copy the example env file and adjust if needed:
+#### 2. Configure environment
 
 ```bash
 cp .env.example .env
+```
+
+Add a `DATABASE_URL` for local Postgres, e.g.:
+
+```bash
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/skylagring
 ```
 
 Generate a strong `AUTH_SECRET` for production:
@@ -57,19 +76,19 @@ Generate a strong `AUTH_SECRET` for production:
 openssl rand -base64 32
 ```
 
-### 3. Install dependencies
+#### 3. Install dependencies
 
 ```bash
 npm install
 ```
 
-### 4. Create the database schema
+#### 4. Create the database schema
 
 ```bash
 npx prisma db push
 ```
 
-### 5. Run the app
+#### 5. Run the app
 
 ```bash
 npm run dev

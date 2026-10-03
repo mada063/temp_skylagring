@@ -5,12 +5,32 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: skylagring
-    ports:
-      - "5432:5432"
     volumes:
       - skylagring-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d skylagring"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    container_name: skylagring-app
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@db:5432/skylagring
+      AUTH_SECRET: ${AUTH_SECRET:-change-me}
+      NODE_ENV: production
+    volumes:
+      - skylagring-uploads:/app/uploads
+    depends_on:
+      db:
+        condition: service_healthy
 
 volumes:
   skylagring-pgdata:
+  skylagring-uploads:
