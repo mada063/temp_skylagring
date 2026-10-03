@@ -22,9 +22,11 @@ export type SessionUser = {
 /** Creates a session cookie for the given user. */
 export async function createSession(userId: string): Promise<void> {
   const token = await signSession(userId);
+  // Only set Secure when explicitly enabled. Next inlines NODE_ENV at build
+  // time, so defaulting to "production => secure" breaks plain-HTTP LXC deploys.
   cookies().set(SESSION_COOKIE, token, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
+    secure: process.env["COOKIE_SECURE"] === "true",
     sameSite: "lax",
     path: "/",
     maxAge: SESSION_MAX_AGE,

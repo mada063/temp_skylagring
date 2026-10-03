@@ -24,6 +24,8 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@db:5432/skylagring
       AUTH_SECRET: ${AUTH_SECRET:-change-me}
+      # Set true once you terminate TLS in front of the app.
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
       NODE_ENV: production
     volumes:
       - skylagring-uploads:/app/uploads
