@@ -509,15 +509,9 @@ export default function DriveExplorer({
       dest: string,
       relPath: string,
     ) => {
-      const qs = new URLSearchParams({ folderId: dest });
-      if (relPath) qs.set("path", relPath);
-      await uploadApi.upload(jobId, `/api/files?${qs}`, file, {
-        label: file.name,
-        size: file.size,
-        headers: {
-          "Content-Type": file.type || "application/octet-stream",
-          "X-File-Name": encodeURIComponent(file.name),
-        },
+      await uploadApi.uploadFile(jobId, file, {
+        folderId: dest,
+        path: relPath || undefined,
       });
     },
     [uploadApi],

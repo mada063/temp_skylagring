@@ -18,6 +18,10 @@ import {
   X,
 } from "lucide-react";
 import { formatBytes } from "@/lib/fileType";
+import {
+  CHUNKED_UPLOAD_THRESHOLD,
+  UPLOAD_CHUNK_BYTES,
+} from "@/lib/uploadLimit";
 
 export class UploadCancelledError extends Error {
   constructor() {
@@ -56,6 +60,20 @@ type UploadResult = { files?: unknown[]; error?: string };
 
 type ZipJobHandle = { jobId: string; signal: AbortSignal };
 
+type UploadMeta = {
+  label: string;
+  size: number;
+  headers?: Record<string, string>;
+  method?: string;
+  /** Shared active-row id + byte offset for multi-request (chunked) uploads. */
+  progress?: {
+    id: string;
+    offset: number;
+    /** When false, leave the active row and don't bump completed/failed. */
+    settle?: boolean;
+  };
+};
+
 type UploadApi = {
   beginJob: () => string;
   setFound: (jobId: string, found: number) => void;
@@ -65,7 +83,13 @@ type UploadApi = {
     jobId: string,
     url: string,
     body: XMLHttpRequestBodyInit,
-    meta: { label: string; size: number; headers?: Record<string, string> },
+    meta: UploadMeta,
+  ) => Promise<UploadResult>;
+  /** Single-shot or chunked upload depending on file size. */
+  uploadFile: (
+    jobId: string,
+    file: File,
+    opts: { folderId: string; path?: string },
   ) => Promise<UploadResult>;
   finishJob: (jobId: string) => void;
   failJob: (jobId: string, message: string) => void;
@@ -271,20 +295,26 @@ export default function UploadProvider({
       jobId: string,
       url: string,
       body: XMLHttpRequestBodyInit,
-      meta: { label: string; size: number; headers?: Record<string, string> },
+      meta: UploadMeta,
     ) => {
       if (cancelled.current.has(jobId)) {
         return Promise.reject(new UploadCancelledError());
       }
 
-      const fileId = Math.random().toString(36).slice(2);
-      patchJob(jobId, (j) => ({
-        ...j,
-        active: [
-          ...j.active,
-          { id: fileId, name: meta.label, loaded: 0, size: meta.size },
-        ],
-      }));
+      const fileId = meta.progress?.id ?? Math.random().toString(36).slice(2);
+      const progressOffset = meta.progress?.offset ?? 0;
+      const settle = meta.progress?.settle !== false;
+      const reuseActive = Boolean(meta.progress?.id);
+
+      if (!reuseActive) {
+        patchJob(jobId, (j) => ({
+          ...j,
+          active: [
+            ...j.active,
+            { id: fileId, name: meta.label, loaded: 0, size: meta.size },
+          ],
+        }));
+      }
 
       const applyProgress = (loaded: number, size: number) => {
         if (cancelled.current.has(jobId)) return;
@@ -307,7 +337,7 @@ export default function UploadProvider({
           delete progressTimers.current[`${jobId}:${fileId}`];
         };
 
-        xhr.open("POST", url);
+        xhr.open(meta.method ?? "POST", url);
         if (meta.headers) {
           for (const [key, value] of Object.entries(meta.headers)) {
             xhr.setRequestHeader(key, value);
@@ -324,8 +354,8 @@ export default function UploadProvider({
           slot.pending = {
             id: fileId,
             name: meta.label,
-            loaded: e.loaded,
-            size: e.total,
+            loaded: progressOffset + e.loaded,
+            size: meta.size,
           };
           if (slot.timer) return;
           slot.timer = setTimeout(() => {
@@ -347,11 +377,13 @@ export default function UploadProvider({
             /* ignore */
           }
           if (xhr.status >= 200 && xhr.status < 300) {
-            patchJob(jobId, (j) => ({
-              ...j,
-              completed: j.completed + 1,
-              active: j.active.filter((a) => a.id !== fileId),
-            }));
+            if (settle) {
+              patchJob(jobId, (j) => ({
+                ...j,
+                completed: j.completed + 1,
+                active: j.active.filter((a) => a.id !== fileId),
+              }));
+            }
             resolve(json);
           } else {
             const msg = json.error || `Upload failed (${xhr.status})`;
@@ -394,6 +426,148 @@ export default function UploadProvider({
     [patchJob],
   );
 
+  const uploadFile = useCallback(
+    async (
+      jobId: string,
+      file: File,
+      opts: { folderId: string; path?: string },
+    ) => {
+      if (cancelled.current.has(jobId)) {
+        throw new UploadCancelledError();
+      }
+
+      if (file.size <= CHUNKED_UPLOAD_THRESHOLD) {
+        const qs = new URLSearchParams({ folderId: opts.folderId });
+        if (opts.path) qs.set("path", opts.path);
+        return upload(jobId, `/api/files?${qs}`, file, {
+          label: file.name,
+          size: file.size,
+          headers: {
+            "Content-Type": file.type || "application/octet-stream",
+            "X-File-Name": encodeURIComponent(file.name),
+          },
+        });
+      }
+
+      // Chunked path: init → sequential PUTs → complete.
+      // Survives reverse-proxy body limits that drop single multi-hundred-MB POSTs.
+      const activeId = Math.random().toString(36).slice(2);
+      patchJob(jobId, (j) => ({
+        ...j,
+        active: [
+          ...j.active,
+          { id: activeId, name: file.name, loaded: 0, size: file.size },
+        ],
+      }));
+
+      let uploadId: string | null = null;
+      /** True once a chunk xhr has already counted this file as failed. */
+      let chunkFailed = false;
+
+      const markFailed = (message: string) => {
+        patchJob(jobId, (j) => ({
+          ...j,
+          failed: j.failed + 1,
+          completed: j.completed + 1,
+          active: j.active.filter((a) => a.id !== activeId),
+          errors: [...j.errors.slice(-4), `${file.name}: ${message}`],
+        }));
+      };
+
+      const markDone = () => {
+        patchJob(jobId, (j) => ({
+          ...j,
+          completed: j.completed + 1,
+          active: j.active.filter((a) => a.id !== activeId),
+        }));
+      };
+
+      try {
+        const initRes = await fetch("/api/files/sessions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: file.name,
+            size: file.size,
+            mimeType: file.type || "application/octet-stream",
+            folderId: opts.folderId,
+            path: opts.path || "",
+          }),
+        });
+        const initJson = (await initRes.json().catch(() => ({}))) as {
+          uploadId?: string;
+          chunkSize?: number;
+          error?: string;
+        };
+        if (!initRes.ok || !initJson.uploadId) {
+          throw new Error(initJson.error || `Upload failed (${initRes.status})`);
+        }
+        uploadId = initJson.uploadId;
+        const chunkSize = initJson.chunkSize || UPLOAD_CHUNK_BYTES;
+
+        for (let offset = 0; offset < file.size; offset += chunkSize) {
+          if (cancelled.current.has(jobId)) {
+            throw new UploadCancelledError();
+          }
+          const end = Math.min(offset + chunkSize, file.size);
+          const blob = file.slice(offset, end);
+          try {
+            await upload(jobId, `/api/files/sessions/${uploadId}`, blob, {
+              label: file.name,
+              size: file.size,
+              method: "PUT",
+              headers: {
+                "Content-Type": "application/octet-stream",
+                "X-Chunk-Offset": String(offset),
+              },
+              progress: {
+                id: activeId,
+                offset,
+                settle: false,
+              },
+            });
+          } catch (err) {
+            chunkFailed = !(err instanceof UploadCancelledError);
+            throw err;
+          }
+        }
+
+        const completeRes = await fetch(
+          `/api/files/sessions/${uploadId}/complete`,
+          { method: "POST" },
+        );
+        const completeJson = (await completeRes
+          .json()
+          .catch(() => ({}))) as UploadResult;
+        if (!completeRes.ok) {
+          throw new Error(
+            completeJson.error || `Upload failed (${completeRes.status})`,
+          );
+        }
+        markDone();
+        return completeJson;
+      } catch (err) {
+        if (uploadId) {
+          void fetch(`/api/files/sessions/${uploadId}`, {
+            method: "DELETE",
+          }).catch(() => {});
+        }
+        if (err instanceof UploadCancelledError) {
+          patchJob(jobId, (j) => ({
+            ...j,
+            active: j.active.filter((a) => a.id !== activeId),
+          }));
+          throw err;
+        }
+        if (!chunkFailed) {
+          markFailed(err instanceof Error ? err.message : "Upload failed");
+        }
+        throw err;
+      }
+    },
+    [patchJob, upload],
+  );
+
   return (
     <UploadContext.Provider
       value={{
@@ -403,6 +577,7 @@ export default function UploadProvider({
         startPreparing,
         startUploading,
         upload,
+        uploadFile,
         finishJob,
         failJob,
         isCancelled,

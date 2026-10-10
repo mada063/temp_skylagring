@@ -13,6 +13,15 @@ export const DEFAULT_UPLOAD_CONCURRENCY = 8;
  */
 export const LARGE_FILE_BYTES = 200 * 1024 * 1024; // 200 MB
 
+/**
+ * Per-request chunk size for large uploads. Kept well under common reverse-proxy
+ * body limits (often ~100–200 MB) that otherwise drop the TCP connection mid-POST.
+ */
+export const UPLOAD_CHUNK_BYTES = 32 * 1024 * 1024; // 32 MB
+
+/** Files larger than one chunk use the sessioned multi-request upload path. */
+export const CHUNKED_UPLOAD_THRESHOLD = UPLOAD_CHUNK_BYTES;
+
 /** Parallel folder-scan workers while reading a dropped directory. */
 export const MIN_SCAN_CONCURRENCY = 4;
 export const MAX_SCAN_CONCURRENCY = 64;
