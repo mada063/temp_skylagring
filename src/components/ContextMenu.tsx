@@ -39,7 +39,7 @@ export default function ContextMenu({
  }, [onClose]);
 
  // Keep the menu inside the viewport.
- const width = 190;
+ const width = 220;
  const height = items.length * 34 + 8;
  const left =
  typeof window !== "undefined" ? Math.min(x, window.innerWidth - width - 8) : x;

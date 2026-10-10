@@ -14,6 +14,15 @@ export async function saveFileBytes(fileId: string, bytes: Buffer): Promise<void
   await fs.writeFile(diskPath(fileId), bytes);
 }
 
+/** Duplicate on-disk bytes from one file id to another. */
+export async function copyFileBytes(
+  fromId: string,
+  toId: string,
+): Promise<void> {
+  await fs.mkdir(UPLOAD_DIR, { recursive: true });
+  await fs.copyFile(diskPath(fromId), diskPath(toId));
+}
+
 export async function fileExistsOnDisk(fileId: string): Promise<boolean> {
   try {
     await fs.access(diskPath(fileId));

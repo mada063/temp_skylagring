@@ -16,18 +16,7 @@ only piece of infrastructure you need.
 - **Folder creation**, rename, and delete (with cascading delete).
 - **File-type icons** for images, video, audio, PDF, archives, code, docs, and more.
 - **Broad file support** — any file type; per-file size is configurable in Settings (up to 50 GB).
-- **Profile settings** (name + profile picture) and **account settings** (password change, usage).
-
-## Tech stack
-
-| Concern       | Choice                                   |
-| ------------- | ---------------------------------------- |
-| Framework     | Next.js 14 (App Router, TypeScript)      |
-| Styling       | Tailwind CSS (flat dark theme)           |
-| Database      | PostgreSQL via Prisma                    |
-| File storage  | Bytes stored in Postgres (`FileData`)    |
-| Auth          | bcryptjs + `jose` JWT in an httpOnly cookie |
-| Icons         | lucide-react                             |
+- **Profile settings** (name + profile picture) and **account settings** (password change, usage).                         |
 
 ## Getting started
 

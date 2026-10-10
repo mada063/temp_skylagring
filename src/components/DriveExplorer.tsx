@@ -18,11 +18,17 @@ import {
  LayoutGrid,
  ListTree,
  Eye,
+ Copy,
+ ClipboardPaste,
 } from "lucide-react";
 import clsx from "clsx";
 import FileIcon from "@/components/FileIcon";
 import ContextMenu, { type MenuItem } from "@/components/ContextMenu";
 import { useUploader, UploadCancelledError } from "@/components/UploadProvider";
+import LassoSurface, {
+  applyItemClick,
+  itemKey,
+} from "@/components/LassoSurface";
 import { categorize, formatBytes } from "@/lib/fileType";
 import {
   DEFAULT_UPLOAD_CONCURRENCY,
@@ -183,6 +189,13 @@ export default function DriveExplorer({
  >({});
  const [expanded, setExpanded] = useState<Set<string>>(new Set([ROOT]));
  const [selected, setSelected] = useState<string>(ROOT);
+ const [selectedItems, setSelectedItems] = useState<Set<string>>(
+ () => new Set(),
+ );
+ const [clipboard, setClipboard] = useState<{
+ fileIds: string[];
+ folderIds: string[];
+ } | null>(null);
  const [loading, setLoading] = useState(true);
  const [busy, setBusy] = useState<string | null>(null);
  const [dropTarget, setDropTarget] = useState<string | null>(null);
@@ -197,6 +210,57 @@ export default function DriveExplorer({
  } | null>(null);
 
  const activeFolder = view === "grid" ? gridFolder : selected;
+ const clipboardRef = useRef(clipboard);
+ clipboardRef.current = clipboard;
+ const selectedItemsRef = useRef(selectedItems);
+ selectedItemsRef.current = selectedItems;
+ const activeFolderRef = useRef(activeFolder);
+ activeFolderRef.current = activeFolder;
+ const copySelectionRef = useRef<(keys: Set<string>) => void>(() => {});
+ const pasteIntoRef = useRef<(destFolderId: string) => Promise<void>>(
+ async () => {},
+ );
+ const deleteSelectionRef = useRef<(keys: Set<string>) => void>(() => {});
+
+ // Delete / Backspace → trash; Ctrl/Cmd+C copy; Ctrl/Cmd+V paste; Esc clears.
+ useEffect(() => {
+ function onKey(e: KeyboardEvent) {
+ const tag = (e.target as HTMLElement | null)?.tagName;
+ if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+ if ((e.target as HTMLElement | null)?.isContentEditable) return;
+
+ const mod = e.ctrlKey || e.metaKey;
+ const key = e.key.toLowerCase();
+ const code = e.code;
+
+ if (e.key === "Escape") {
+ setSelectedItems(new Set());
+ return;
+ }
+
+ if (!mod && (e.key === "Delete" || e.key === "Backspace")) {
+ if (selectedItemsRef.current.size === 0) return;
+ e.preventDefault();
+ deleteSelectionRef.current(new Set(selectedItemsRef.current));
+ return;
+ }
+
+ if (mod && (key === "c" || code === "KeyC")) {
+ if (selectedItemsRef.current.size === 0) return;
+ e.preventDefault();
+ copySelectionRef.current(new Set(selectedItemsRef.current));
+ return;
+ }
+
+ if (mod && (key === "v" || code === "KeyV")) {
+ if (!clipboardRef.current) return;
+ e.preventDefault();
+ void pasteIntoRef.current(activeFolderRef.current);
+ }
+ }
+ window.addEventListener("keydown", onKey);
+ return () => window.removeEventListener("keydown", onKey);
+ }, []);
 
  // ---- data loading -------------------------------------------------------
 
@@ -391,6 +455,11 @@ export default function DriveExplorer({
     });
     if (tree.has(selected)) setSelected(parentId);
     if (tree.has(gridFolder)) setGridFolder(parentId);
+    setSelectedItems((prev) => {
+      const next = new Set(prev);
+      for (const id of tree) next.delete(itemKey("folder", id));
+      return next;
+    });
 
     try {
       const res = await fetch(`/api/folders/${f.id}`, { method: "DELETE" });
@@ -410,6 +479,11 @@ export default function DriveExplorer({
       ...prev,
       [parent]: (prev[parent] ?? []).filter((x) => x.id !== file.id),
     }));
+    setSelectedItems((prev) => {
+      const next = new Set(prev);
+      next.delete(itemKey("file", file.id));
+      return next;
+    });
 
     try {
       const res = await fetch(`/api/files/${file.id}`, { method: "DELETE" });
@@ -588,18 +662,23 @@ export default function DriveExplorer({
 
  const dt = e.dataTransfer;
 
- // Snapshot the FileList first. Calling webkitGetAsEntry() can empty or
- // truncate dataTransfer.files in some browsers, which is why only the
- // first file was being uploaded.
+ // Snapshot FileList BEFORE touching items — webkitGetAsEntry() can empty
+ // or truncate dataTransfer.files in some browsers.
  const droppedFiles = Array.from(dt.files ?? []);
 
+ // Also collect via the items API. On Linux (esp. KDE/Dolphin + Firefox, or
+ // some Wayland portals) files.length is often 1 while items still has every
+ // file — so we keep both and pick the richer source below.
  const entries: FileSystemEntry[] = [];
+ const itemFiles: File[] = [];
  if (dt.items && dt.items.length > 0) {
  for (let i = 0; i < dt.items.length; i++) {
  const item = dt.items[i];
  if (item.kind !== "file") continue;
- const entry = item.webkitGetAsEntry?.();
+ const entry = item.webkitGetAsEntry?.() ?? null;
  if (entry) entries.push(entry);
+ const file = item.getAsFile?.() ?? null;
+ if (file) itemFiles.push(file);
  }
  }
  const hasDirectory = entries.some((en) => en.isDirectory);
@@ -610,12 +689,19 @@ export default function DriveExplorer({
  return;
  }
 
- if (droppedFiles.length > 0) {
- void uploadFiles(droppedFiles, folderId);
+ // Prefer whichever flat-file source saw the most files.
+ const bestFiles =
+ itemFiles.length > droppedFiles.length
+ ? itemFiles
+ : droppedFiles.length > 0
+ ? droppedFiles
+ : itemFiles;
+
+ if (bestFiles.length > 0 && bestFiles.length >= entries.length) {
+ void uploadFiles(bestFiles, folderId);
  return;
  }
 
- // Last-resort fallback to the entries API.
  if (entries.length > 0) {
  void uploadEntries(entries, folderId);
  return;
@@ -646,6 +732,58 @@ export default function DriveExplorer({
  e.preventDefault();
  e.stopPropagation();
  setMenu({ x: e.clientX, y: e.clientY, items });
+ }
+
+ function parseSelectedKeys(keys: Set<string>): {
+ fileIds: string[];
+ folderIds: string[];
+ } {
+ const fileIds: string[] = [];
+ const folderIds: string[] = [];
+ for (const key of keys) {
+ if (key.startsWith("file:")) fileIds.push(key.slice(5));
+ else if (key.startsWith("folder:")) folderIds.push(key.slice(7));
+ }
+ return { fileIds, folderIds };
+ }
+
+ /** Drop nested folders / files already covered by a selected parent folder. */
+ function pruneSelection(
+ fileIds: string[],
+ folderIds: string[],
+ ): { fileIds: string[]; folderIds: string[] } {
+ if (folderIds.length === 0) return { fileIds, folderIds };
+
+ const covered = new Set<string>();
+ const rootFolderIds: string[] = [];
+ for (const id of folderIds) {
+ let nested = false;
+ for (const other of folderIds) {
+ if (other === id) continue;
+ if (collectDescendantIds(folders, other).has(id)) {
+ nested = true;
+ break;
+ }
+ }
+ if (!nested) rootFolderIds.push(id);
+ }
+ for (const id of rootFolderIds) {
+ for (const d of collectDescendantIds(folders, id)) covered.add(d);
+ }
+
+ const fileById = new Map<string, FileItem>();
+ for (const list of Object.values(filesByFolder)) {
+ for (const f of list) fileById.set(f.id, f);
+ }
+
+ return {
+ folderIds: rootFolderIds,
+ fileIds: fileIds.filter((id) => {
+ const f = fileById.get(id);
+ if (!f?.folderId) return true;
+ return !covered.has(f.folderId);
+ }),
+ };
  }
 
  function downloadFile(file: FileItem) {
@@ -693,8 +831,199 @@ export default function DriveExplorer({
     }
   }
 
+  async function downloadBulkZip(fileIds: string[], folderIds: string[]) {
+    const count = fileIds.length + folderIds.length;
+    const label =
+      count === 1
+        ? "1 item"
+        : `${count} items`;
+    const { jobId, signal } = uploadApi.beginZipJob(label);
+    try {
+      const res = await fetch("/api/download", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fileIds, folderIds }),
+        signal,
+      });
+      if (uploadApi.isCancelled(jobId)) return;
+      if (!res.ok) {
+        throw new Error(`Failed (${res.status})`);
+      }
+      const blob = await res.blob();
+      if (uploadApi.isCancelled(jobId)) return;
+
+      const disposition = res.headers.get("Content-Disposition") ?? "";
+      const match = /filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i.exec(
+        disposition,
+      );
+      const filename = match
+        ? decodeURIComponent(match[1] || match[2])
+        : `download-${count}-items.zip`;
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      uploadApi.finishJob(jobId);
+    } catch (err) {
+      if (
+        uploadApi.isCancelled(jobId) ||
+        (err instanceof DOMException && err.name === "AbortError")
+      ) {
+        return;
+      }
+      uploadApi.failJob(
+        jobId,
+        err instanceof Error ? err.message : "Could not prepare ZIP",
+      );
+    }
+  }
+
+  function downloadSelection(keys: Set<string>) {
+    const parsed = parseSelectedKeys(keys);
+    const { fileIds, folderIds } = pruneSelection(
+      parsed.fileIds,
+      parsed.folderIds,
+    );
+    if (fileIds.length === 0 && folderIds.length === 0) return;
+
+    if (fileIds.length === 1 && folderIds.length === 0) {
+      const file = Object.values(filesByFolder)
+        .flat()
+        .find((f) => f.id === fileIds[0]);
+      if (file) downloadFile(file);
+      return;
+    }
+    if (fileIds.length === 0 && folderIds.length === 1) {
+      const folder = folders.find((f) => f.id === folderIds[0]);
+      if (folder) void downloadFolderZip(folder);
+      return;
+    }
+    void downloadBulkZip(fileIds, folderIds);
+  }
+
+  function copySelection(keys: Set<string>) {
+    const parsed = parseSelectedKeys(keys);
+    const { fileIds, folderIds } = pruneSelection(
+      parsed.fileIds,
+      parsed.folderIds,
+    );
+    if (fileIds.length === 0 && folderIds.length === 0) return;
+    setClipboard({ fileIds, folderIds });
+  }
+
+  async function pasteInto(destFolderId: string) {
+    const clip = clipboardRef.current;
+    if (!clip) return;
+    if (clip.fileIds.length === 0 && clip.folderIds.length === 0) return;
+
+    setBusy("Pasting…");
+    try {
+      const res = await fetch("/api/copy", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fileIds: clip.fileIds,
+          folderIds: clip.folderIds,
+          folderId: destFolderId === ROOT ? "root" : destFolderId,
+        }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        window.alert(json.error ?? "Paste failed.");
+        return;
+      }
+      setExpanded((prev) => new Set(prev).add(destFolderId));
+      await reload();
+    } catch {
+      window.alert("Paste failed.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  copySelectionRef.current = copySelection;
+  pasteIntoRef.current = pasteInto;
+
+  async function deleteSelection(keys: Set<string>) {
+    const parsed = parseSelectedKeys(keys);
+    const { fileIds, folderIds } = pruneSelection(
+      parsed.fileIds,
+      parsed.folderIds,
+    );
+    const total = fileIds.length + folderIds.length;
+    if (total === 0) return;
+
+    const label =
+      total === 1
+        ? "this item"
+        : `these ${total} items`;
+    if (
+      !window.confirm(
+        `Move ${label} to the trash? Folders include everything inside them.`,
+      )
+    ) {
+      return;
+    }
+
+    // Optimistic UI: hide selected files and folder trees.
+    const trees = folderIds.map((id) => collectDescendantIds(folders, id));
+    const allFolderIds = new Set<string>();
+    for (const tree of trees) for (const id of tree) allFolderIds.add(id);
+
+    setFolders((prev) => prev.filter((f) => !allFolderIds.has(f.id)));
+    setFilesByFolder((prev) => {
+      const next = { ...prev };
+      for (const id of allFolderIds) delete next[id];
+      for (const [folderKey, list] of Object.entries(next)) {
+        next[folderKey] = list.filter((f) => !fileIds.includes(f.id));
+      }
+      return next;
+    });
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      for (const id of allFolderIds) next.delete(id);
+      return next;
+    });
+    if (allFolderIds.has(selected)) {
+      const parent =
+        folders.find((f) => folderIds.includes(f.id))?.parentId ?? ROOT;
+      setSelected(parent);
+    }
+    if (allFolderIds.has(gridFolder)) {
+      const parent =
+        folders.find((f) => folderIds.includes(f.id))?.parentId ?? ROOT;
+      setGridFolder(parent);
+    }
+    setSelectedItems(new Set());
+
+    try {
+      const results = await Promise.all([
+        ...folderIds.map((id) =>
+          fetch(`/api/folders/${id}`, { method: "DELETE" }),
+        ),
+        ...fileIds.map((id) =>
+          fetch(`/api/files/${id}`, { method: "DELETE" }),
+        ),
+      ]);
+      if (results.some((r) => !r.ok)) throw new Error("delete failed");
+      broadcastRefresh();
+    } catch {
+      await reload();
+      window.alert("Could not move some items to the trash.");
+    }
+  }
+
+  deleteSelectionRef.current = (keys) => {
+    void deleteSelection(keys);
+  };
+
  function folderMenu(folder: Folder): MenuItem[] {
- return [
+ const items: MenuItem[] = [
  {
  label: "Open",
  icon: <FolderOpen className="h-4 w-4" />,
@@ -707,6 +1036,21 @@ export default function DriveExplorer({
  onClick: () => downloadFolderZip(folder),
  },
  {
+ label: "Copy",
+ icon: <Copy className="h-4 w-4" />,
+ onClick: () =>
+ copySelection(new Set([itemKey("folder", folder.id)])),
+ },
+ ];
+ if (clipboard) {
+ items.push({
+ label: "Paste into folder",
+ icon: <ClipboardPaste className="h-4 w-4" />,
+ onClick: () => void pasteInto(folder.id),
+ });
+ }
+ items.push(
+ {
  label: "New subfolder",
  icon: <FolderPlus className="h-4 w-4" />,
  onClick: () => createFolder(folder.id),
@@ -718,13 +1062,14 @@ export default function DriveExplorer({
  },
  { separator: true },
  {
-        label: "Move to trash",
-        icon: <Trash2 className="h-4 w-4" />,
-        danger: true,
-        onClick: () => deleteFolder(folder),
-      },
-    ];
-  }
+ label: "Move to trash",
+ icon: <Trash2 className="h-4 w-4" />,
+ danger: true,
+ onClick: () => deleteFolder(folder),
+ },
+ );
+ return items;
+ }
 
   function fileMenu(file: FileItem): MenuItem[] {
     return [
@@ -740,6 +1085,11 @@ export default function DriveExplorer({
         onClick: () => downloadFile(file),
       },
       {
+        label: "Copy",
+        icon: <Copy className="h-4 w-4" />,
+        onClick: () => copySelection(new Set([itemKey("file", file.id)])),
+      },
+      {
         label: "Rename",
         icon: <Pencil className="h-4 w-4" />,
         onClick: () => renameFile(file),
@@ -752,6 +1102,79 @@ export default function DriveExplorer({
         onClick: () => deleteFile(file),
       },
     ];
+  }
+
+  function multiMenu(keys: Set<string>): MenuItem[] {
+    const n = keys.size;
+    return [
+      {
+        label: `Download ${n} items as ZIP`,
+        icon: <Download className="h-4 w-4" />,
+        onClick: () => downloadSelection(keys),
+      },
+      {
+        label: `Copy ${n} items`,
+        icon: <Copy className="h-4 w-4" />,
+        onClick: () => copySelection(keys),
+      },
+      { separator: true },
+      {
+        label: `Move ${n} items to trash`,
+        icon: <Trash2 className="h-4 w-4" />,
+        danger: true,
+        onClick: () => void deleteSelection(keys),
+      },
+    ];
+  }
+
+  function backgroundMenu(): MenuItem[] {
+    const items: MenuItem[] = [
+      {
+        label: "New folder",
+        icon: <FolderPlus className="h-4 w-4" />,
+        onClick: () => createFolder(activeFolder),
+      },
+    ];
+    if (clipboard) {
+      items.push({
+        label: "Paste",
+        icon: <ClipboardPaste className="h-4 w-4" />,
+        onClick: () => void pasteInto(activeFolder),
+      });
+    }
+    return items;
+  }
+
+  function openBackgroundMenu(e: React.MouseEvent) {
+    const target = e.target as HTMLElement;
+    if (target.closest("[data-item-key], a, button, input, textarea, label")) {
+      return;
+    }
+    openMenu(e, backgroundMenu());
+  }
+
+  function openFolderMenu(e: React.MouseEvent, folder: Folder) {
+    const key = itemKey("folder", folder.id);
+    if (selectedItems.size > 1 && selectedItems.has(key)) {
+      openMenu(e, multiMenu(new Set(selectedItems)));
+      return;
+    }
+    if (!selectedItems.has(key)) {
+      setSelectedItems(new Set([key]));
+    }
+    openMenu(e, folderMenu(folder));
+  }
+
+  function openFileMenu(e: React.MouseEvent, file: FileItem) {
+    const key = itemKey("file", file.id);
+    if (selectedItems.size > 1 && selectedItems.has(key)) {
+      openMenu(e, multiMenu(new Set(selectedItems)));
+      return;
+    }
+    if (!selectedItems.has(key)) {
+      setSelectedItems(new Set([key]));
+    }
+    openMenu(e, fileMenu(file));
   }
 
  const contextMenu = menu ? (
@@ -804,7 +1227,7 @@ export default function DriveExplorer({
 
  return (
  <div className="flex h-full min-h-0 flex-col">
- {view === "grid" ? (
+   {view === "grid" ? (
  <GridView
  path={folderPath(gridFolder)}
  loading={loading}
@@ -813,16 +1236,18 @@ export default function DriveExplorer({
  dropTarget={dropTarget}
  gridFolder={gridFolder}
  actions={actions}
+ selectedItems={selectedItems}
+ onSelectedChange={setSelectedItems}
  onOpenFolder={openGridFolder}
- onDownloadFolder={downloadFolderZip}
  onOpenFile={(f) =>
  window.open(`/api/files/${f.id}/download?inline=1`, "_blank")
  }
  onDrop={handleDrop}
  onDragOver={allowDrop}
  onDragLeaveTarget={() => setDropTarget(null)}
- onFolderMenu={(e, f) => openMenu(e, folderMenu(f))}
- onFileMenu={(e, f) => openMenu(e, fileMenu(f))}
+ onFolderMenu={openFolderMenu}
+ onFileMenu={openFileMenu}
+ onBackgroundMenu={openBackgroundMenu}
  onUpload={(files) => uploadFiles(files, gridFolder)}
  />
  ) : (
@@ -832,15 +1257,18 @@ export default function DriveExplorer({
  {actions}
  </div>
 
- <div
+ <LassoSurface
  className={clsx(
  "min-h-0 flex-1 overflow-auto px-3 pb-6",
  dropTarget === ROOT && "bg-accent/5",
  )}
+ selected={selectedItems}
+ onSelectedChange={setSelectedItems}
  onDragOver={(e) => allowDrop(e, ROOT)}
  onDragLeave={() => setDropTarget(null)}
  onDrop={(e) => handleDrop(e, ROOT)}
- onClick={() => setSelected(ROOT)}
+ onBackgroundClick={() => setSelected(ROOT)}
+ onBackgroundContextMenu={openBackgroundMenu}
  >
  {loading ? (
  <div className="flex items-center gap-2 px-4 py-8 text-sm text-muted">
@@ -854,9 +1282,11 @@ export default function DriveExplorer({
  filesByFolder={filesByFolder}
  expanded={expanded}
  selected={selected}
+ selectedItems={selectedItems}
  dropTarget={dropTarget}
  onToggle={toggle}
  onSelect={setSelected}
+ onSelectedChange={setSelectedItems}
  onDownloadFolder={downloadFolderZip}
  onDrop={handleDrop}
  onDragOver={allowDrop}
@@ -866,13 +1296,13 @@ export default function DriveExplorer({
  onDeleteFolder={deleteFolder}
  onRenameFile={renameFile}
  onDeleteFile={deleteFile}
- onFolderMenu={(e, f) => openMenu(e, folderMenu(f))}
- onFileMenu={(e, f) => openMenu(e, fileMenu(f))}
+ onFolderMenu={openFolderMenu}
+ onFileMenu={openFileMenu}
  />
  ) : (
  <EmptyState onUpload={(files) => uploadFiles(files, ROOT)} />
  )}
- </div>
+ </LassoSurface>
  </>
  )}
  {contextMenu}
@@ -895,9 +1325,11 @@ function TreeLevel(props: {
  filesByFolder: Record<string, FileItem[]>;
  expanded: Set<string>;
  selected: string;
+ selectedItems: Set<string>;
  dropTarget: string | null;
  onToggle: (id: string) => void;
  onSelect: (id: string) => void;
+ onSelectedChange: (next: Set<string>) => void;
  onDownloadFolder: (f: Folder) => void;
  onDrop: (e: React.DragEvent, id: string) => void;
  onDragOver: (e: React.DragEvent, id: string) => void;
@@ -917,6 +1349,7 @@ function TreeLevel(props: {
  filesByFolder,
  expanded,
  selected,
+ selectedItems,
  dropTarget,
  } = props;
  const subfolders = childrenOf(parentId === ROOT ? null : parentId);
@@ -926,6 +1359,7 @@ function TreeLevel(props: {
  <>
  {subfolders.map((folder) => {
  const isOpen = expanded.has(folder.id);
+ const key = itemKey("folder", folder.id);
  return (
  <div key={folder.id}>
  <TreeRow
@@ -933,11 +1367,18 @@ function TreeLevel(props: {
  label={folder.name}
  expanded={isOpen}
  selected={selected === folder.id}
+ itemSelected={selectedItems.has(key)}
+ itemKeyAttr={key}
  isDropTarget={dropTarget === folder.id}
  draggable
  dragItem={{ kind: "folder", id: folder.id }}
  onToggle={() => props.onToggle(folder.id)}
- onSelect={() => props.onSelect(folder.id)}
+ onSelect={(e) => {
+ props.onSelect(folder.id);
+ props.onSelectedChange(
+ applyItemClick(selectedItems, key, e),
+ );
+ }}
  onDoubleClick={() => props.onDownloadFolder(folder)}
  onDrop={(e) => props.onDrop(e, folder.id)}
  onDragOver={(e) => props.onDragOver(e, folder.id)}
@@ -987,16 +1428,24 @@ function TreeLevel(props: {
  );
  })}
 
- {files.map((file) => (
+ {files.map((file) => {
+ const key = itemKey("file", file.id);
+ return (
  <FileRow
  key={file.id}
  file={file}
  depth={depth}
+ itemSelected={selectedItems.has(key)}
+ itemKeyAttr={key}
+ onSelect={(e) =>
+ props.onSelectedChange(applyItemClick(selectedItems, key, e))
+ }
  onRename={() => props.onRenameFile(file)}
  onDelete={() => props.onDeleteFile(file)}
  onContextMenu={(e) => props.onFileMenu(e, file)}
  />
- ))}
+ );
+ })}
 
  {subfolders.length === 0 && files.length === 0 && parentId !== ROOT && (
  <div
@@ -1015,6 +1464,8 @@ function TreeRow({
  label,
  expanded,
  selected,
+ itemSelected,
+ itemKeyAttr,
  isDropTarget,
  isRootNode,
  draggable,
@@ -1033,6 +1484,8 @@ function TreeRow({
  label: string;
  expanded: boolean;
  selected: boolean;
+ itemSelected?: boolean;
+ itemKeyAttr?: string;
  isDropTarget?: boolean;
  isRootNode?: boolean;
  draggable?: boolean;
@@ -1040,7 +1493,7 @@ function TreeRow({
  icon: React.ReactNode;
  actions?: React.ReactNode;
  onToggle: () => void;
- onSelect: () => void;
+ onSelect: (e: React.MouseEvent) => void;
  onDoubleClick?: () => void;
  onDrop?: (e: React.DragEvent) => void;
  onDragOver?: (e: React.DragEvent) => void;
@@ -1049,6 +1502,7 @@ function TreeRow({
 }) {
  return (
  <div
+ data-item-key={itemKeyAttr}
  draggable={draggable}
  onDragStart={(e) => {
  if (dragItem) {
@@ -1062,7 +1516,7 @@ function TreeRow({
  onContextMenu={onContextMenu}
  onClick={(e) => {
  e.stopPropagation();
- onSelect();
+ onSelect(e);
  }}
  onDoubleClick={(e) => {
  e.stopPropagation();
@@ -1070,7 +1524,11 @@ function TreeRow({
  }}
  className={clsx(
  "group flex items-center gap-1 py-1.5 pr-2 transition-colors",
- selected ? "bg-elevated" : "hover:bg-elevated/60",
+ itemSelected
+ ? "bg-accent/20"
+ : selected
+ ? "bg-elevated"
+ : "hover:bg-elevated/60",
  isDropTarget && "outline outline-2 outline-accent",
  )}
  style={{ paddingLeft: depth * 20 + 8 }}
@@ -1111,18 +1569,25 @@ function TreeRow({
 function FileRow({
  file,
  depth,
+ itemSelected,
+ itemKeyAttr,
+ onSelect,
  onRename,
  onDelete,
  onContextMenu,
 }: {
  file: FileItem;
  depth: number;
+ itemSelected?: boolean;
+ itemKeyAttr?: string;
+ onSelect?: (e: React.MouseEvent) => void;
  onRename: () => void;
  onDelete: () => void;
  onContextMenu?: (e: React.MouseEvent) => void;
 }) {
  return (
  <div
+ data-item-key={itemKeyAttr}
  draggable
  onDragStart={(e) => {
  e.dataTransfer.setData(
@@ -1131,8 +1596,15 @@ function FileRow({
  );
  e.dataTransfer.effectAllowed = "move";
  }}
+ onClick={(e) => {
+ e.stopPropagation();
+ onSelect?.(e);
+ }}
  onContextMenu={onContextMenu}
- className="group flex items-center gap-1 py-1.5 pr-2 hover:bg-elevated/60"
+ className={clsx(
+ "group flex items-center gap-1 py-1.5 pr-2 transition-colors",
+ itemSelected ? "bg-accent/20" : "hover:bg-elevated/60",
+ )}
  style={{ paddingLeft: depth * 20 + 8 }}
  >
  <span className="h-5 w-5 shrink-0" />
@@ -1141,6 +1613,7 @@ function FileRow({
  href={`/api/files/${file.id}/download?inline=1`}
  target="_blank"
  rel="noreferrer"
+ onClick={(e) => e.stopPropagation()}
  className="min-w-0 flex-1 truncate text-sm hover:underline"
  title={file.name}
  >
@@ -1337,14 +1810,16 @@ function GridView({
  dropTarget,
  gridFolder,
  actions,
+ selectedItems,
+ onSelectedChange,
  onOpenFolder,
- onDownloadFolder,
  onOpenFile,
  onDrop,
  onDragOver,
  onDragLeaveTarget,
  onFolderMenu,
  onFileMenu,
+ onBackgroundMenu,
  onUpload,
 }: {
  path: Folder[];
@@ -1354,14 +1829,16 @@ function GridView({
  dropTarget: string | null;
  gridFolder: string;
  actions: React.ReactNode;
+ selectedItems: Set<string>;
+ onSelectedChange: (next: Set<string>) => void;
  onOpenFolder: (id: string) => void;
- onDownloadFolder: (f: Folder) => void;
  onOpenFile: (f: FileItem) => void;
  onDrop: (e: React.DragEvent, id: string) => void;
  onDragOver: (e: React.DragEvent, id: string) => void;
  onDragLeaveTarget: () => void;
  onFolderMenu: (e: React.MouseEvent, f: Folder) => void;
  onFileMenu: (e: React.MouseEvent, f: FileItem) => void;
+ onBackgroundMenu: (e: React.MouseEvent) => void;
  onUpload: (files: FileList) => void;
 }) {
  const empty = folders.length === 0 && files.length === 0;
@@ -1409,14 +1886,17 @@ function GridView({
  {actions}
  </div>
 
- <div
+ <LassoSurface
  className={clsx(
  "min-h-0 flex-1 overflow-auto px-6 pb-6",
  dropTarget === gridFolder && "bg-accent/5",
  )}
+ selected={selectedItems}
+ onSelectedChange={onSelectedChange}
  onDragOver={(e) => onDragOver(e, gridFolder)}
  onDragLeave={onDragLeaveTarget}
  onDrop={(e) => onDrop(e, gridFolder)}
+ onBackgroundContextMenu={onBackgroundMenu}
  >
  {loading ? (
  <div className="flex items-center gap-2 py-8 text-sm text-muted">
@@ -1426,63 +1906,75 @@ function GridView({
  <EmptyState onUpload={onUpload} />
  ) : (
  <div className="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-3">
- {folders.map((folder) => (
+ {folders.map((folder) => {
+ const key = itemKey("folder", folder.id);
+ return (
  <FolderCard
  key={folder.id}
  folder={folder}
+ itemSelected={selectedItems.has(key)}
+ itemKeyAttr={key}
  isDropTarget={dropTarget === folder.id}
+ onSelect={(e) =>
+ onSelectedChange(applyItemClick(selectedItems, key, e))
+ }
  onOpen={() => onOpenFolder(folder.id)}
- onDownload={() => onDownloadFolder(folder)}
  onContextMenu={(e) => onFolderMenu(e, folder)}
  onDrop={(e) => onDrop(e, folder.id)}
  onDragOver={(e) => onDragOver(e, folder.id)}
  onDragLeaveTarget={onDragLeaveTarget}
  />
- ))}
- {files.map((file) => (
+ );
+ })}
+ {files.map((file) => {
+ const key = itemKey("file", file.id);
+ return (
  <FileCard
  key={file.id}
  file={file}
+ itemSelected={selectedItems.has(key)}
+ itemKeyAttr={key}
+ onSelect={(e) =>
+ onSelectedChange(applyItemClick(selectedItems, key, e))
+ }
  onOpen={() => onOpenFile(file)}
  onContextMenu={(e) => onFileMenu(e, file)}
  />
- ))}
+ );
+ })}
  </div>
  )}
- </div>
+ </LassoSurface>
  </div>
  );
 }
 
 function FolderCard({
  folder,
+ itemSelected,
+ itemKeyAttr,
  isDropTarget,
+ onSelect,
  onOpen,
- onDownload,
  onContextMenu,
  onDrop,
  onDragOver,
  onDragLeaveTarget,
 }: {
  folder: Folder;
+ itemSelected: boolean;
+ itemKeyAttr: string;
  isDropTarget: boolean;
+ onSelect: (e: React.MouseEvent) => void;
  onOpen: () => void;
- onDownload: () => void;
  onContextMenu: (e: React.MouseEvent) => void;
  onDrop: (e: React.DragEvent) => void;
  onDragOver: (e: React.DragEvent) => void;
  onDragLeaveTarget: () => void;
 }) {
- const openTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
- useEffect(() => {
- return () => {
- if (openTimer.current) clearTimeout(openTimer.current);
- };
- }, []);
-
  return (
  <button
+ data-item-key={itemKeyAttr}
  draggable
  onDragStart={(e) => {
  e.dataTransfer.setData(
@@ -1491,29 +1983,19 @@ function FolderCard({
  );
  e.dataTransfer.effectAllowed = "move";
  }}
- onClick={() => {
- // Delay open so a double-click can cancel it and download ZIP instead.
- if (openTimer.current) clearTimeout(openTimer.current);
- openTimer.current = setTimeout(() => {
- openTimer.current = null;
- onOpen();
- }, 250);
- }}
+ onClick={(e) => onSelect(e)}
  onDoubleClick={(e) => {
  e.preventDefault();
- if (openTimer.current) {
- clearTimeout(openTimer.current);
- openTimer.current = null;
- }
- onDownload();
+ onOpen();
  }}
  onContextMenu={onContextMenu}
  onDrop={onDrop}
  onDragOver={onDragOver}
  onDragLeave={onDragLeaveTarget}
- title={`${folder.name} · double-click to download ZIP`}
+ title={`${folder.name} · double-click to open`}
  className={clsx(
  "group flex flex-col overflow-hidden border border-border bg-surface text-left transition-colors hover:border-accent/60",
+ itemSelected && "border-accent bg-accent/10",
  isDropTarget && "border-accent outline outline-2 outline-accent",
  )}
  >
@@ -1527,16 +2009,23 @@ function FolderCard({
 
 function FileCard({
  file,
+ itemSelected,
+ itemKeyAttr,
+ onSelect,
  onOpen,
  onContextMenu,
 }: {
  file: FileItem;
+ itemSelected: boolean;
+ itemKeyAttr: string;
+ onSelect: (e: React.MouseEvent) => void;
  onOpen: () => void;
  onContextMenu: (e: React.MouseEvent) => void;
 }) {
  const isImage = categorize(file.name, file.mimeType) === "image";
  return (
  <button
+ data-item-key={itemKeyAttr}
  draggable
  onDragStart={(e) => {
  e.dataTransfer.setData(
@@ -1545,10 +2034,17 @@ function FileCard({
  );
  e.dataTransfer.effectAllowed = "move";
  }}
- onClick={onOpen}
+ onClick={(e) => onSelect(e)}
+ onDoubleClick={(e) => {
+ e.preventDefault();
+ onOpen();
+ }}
  onContextMenu={onContextMenu}
- title={file.name}
- className="group flex flex-col overflow-hidden border border-border bg-surface text-left transition-colors hover:border-accent/60"
+ title={`${file.name} · double-click to open`}
+ className={clsx(
+ "group flex flex-col overflow-hidden border border-border bg-surface text-left transition-colors hover:border-accent/60",
+ itemSelected && "border-accent bg-accent/10",
+ )}
  >
  <div className="flex h-28 items-center justify-center overflow-hidden bg-elevated/40">
  {isImage ? (
