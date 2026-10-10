@@ -1,9 +1,14 @@
 import { prisma } from "@/lib/prisma";
 import { requireUser } from "@/lib/auth";
 import { ApiError, handle } from "@/lib/api";
-import { saveFileBytes } from "@/lib/storage";
+import { deleteFileBytes, saveFileStream } from "@/lib/storage";
 import { ensureFolderPaths } from "@/lib/folders";
 import { fileBaseName } from "@/lib/fileType";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+/** Self-hosted / Docker: allow long-running multi-GB uploads. */
+export const maxDuration = 60 * 60 * 6;
 
 function publicFile<T extends { size: bigint; name: string }>(file: T) {
   return { ...file, name: fileBaseName(file.name), size: Number(file.size) };
@@ -60,16 +65,59 @@ const fileSelect = {
   updatedAt: true,
 } as const;
 
-// Upload one or more files (multipart/form-data).
+/**
+ * Stream a single file upload to disk (constant memory).
+ *
+ * Body = raw file bytes (not multipart). Metadata via query/headers:
+ *   ?folderId=root|<id>  &path=relative/dir
+ *   X-File-Name: URL-encoded filename
+ *   Content-Type: mime
+ *   Content-Length: size (optional but recommended)
+ */
 export async function POST(req: Request) {
   return handle(async () => {
     const user = await requireUser();
     const maxFileSize = Math.max(1, user.maxUploadMb) * 1024 * 1024;
-    const form = await req.formData();
 
-    const folderParam = form.get("folderId");
+    const contentType = req.headers.get("content-type") || "";
+    if (contentType.includes("multipart/form-data")) {
+      throw new ApiError(
+        415,
+        "Multipart uploads are no longer supported. Send the raw file body instead.",
+      );
+    }
+
+    if (!req.body) {
+      throw new ApiError(400, "Empty upload body.");
+    }
+
+    const url = new URL(req.url);
+    const folderParam = url.searchParams.get("folderId");
     const folderId =
-      folderParam && folderParam !== "root" ? String(folderParam) : null;
+      folderParam && folderParam !== "root" ? folderParam : null;
+    const relPath = (url.searchParams.get("path") ?? "").replace(
+      /^\/+|\/+$/g,
+      "",
+    );
+
+    const rawName = req.headers.get("x-file-name");
+    if (!rawName) {
+      throw new ApiError(400, "Missing X-File-Name header.");
+    }
+    let name: string;
+    try {
+      name = fileBaseName(decodeURIComponent(rawName));
+    } catch {
+      throw new ApiError(400, "Invalid X-File-Name header.");
+    }
+
+    const declared = Number(req.headers.get("content-length") || 0);
+    if (declared > maxFileSize) {
+      throw new ApiError(
+        413,
+        `"${name}" is too large (max ${user.maxUploadMb} MB).`,
+      );
+    }
 
     if (folderId) {
       const folder = await prisma.folder.findFirst({
@@ -79,46 +127,46 @@ export async function POST(req: Request) {
       if (!folder) throw new ApiError(404, "Destination folder not found.");
     }
 
-    const uploads = form.getAll("file").filter((f): f is File => f instanceof File);
-    if (uploads.length === 0) throw new ApiError(400, "No files provided.");
-
-    // Optional per-file relative directory paths (for dropped folders).
-    const paths = form.getAll("path").map((p) => String(p ?? ""));
-
-    // Build the folder tree once for this request (race-safe vs other requests).
-    const pathMap = await ensureFolderPaths(
-      user.id,
-      folderId,
-      paths.map((p) => p.replace(/^\/+|\/+$/g, "")),
-    );
-
-    const created = [];
-    for (let i = 0; i < uploads.length; i++) {
-      const upload = uploads[i];
-      if (upload.size > maxFileSize) {
-        throw new ApiError(
-          413,
-          `"${upload.name}" is too large (max ${user.maxUploadMb} MB).`,
-        );
-      }
-      const dir = (paths[i] ?? "").replace(/^\/+|\/+$/g, "");
-      const targetFolderId = pathMap.has(dir) ? pathMap.get(dir)! : folderId;
-
-      const bytes = Buffer.from(await upload.arrayBuffer());
-      const file = await prisma.file.create({
-        data: {
-          name: fileBaseName(upload.name),
-          mimeType: upload.type || "application/octet-stream",
-          size: BigInt(upload.size),
-          userId: user.id,
-          folderId: targetFolderId,
-        },
-        select: fileSelect,
-      });
-      await saveFileBytes(file.id, bytes);
-      created.push(publicFile(file));
+    let targetFolderId = folderId;
+    if (relPath) {
+      const pathMap = await ensureFolderPaths(user.id, folderId, [relPath]);
+      targetFolderId = pathMap.get(relPath) ?? folderId;
     }
 
-    return { files: created };
+    const mimeType = contentType || "application/octet-stream";
+
+    // Create the row first so we have a stable id to stream into.
+    const file = await prisma.file.create({
+      data: {
+        name,
+        mimeType,
+        size: BigInt(declared || 0),
+        userId: user.id,
+        folderId: targetFolderId,
+      },
+      select: fileSelect,
+    });
+
+    try {
+      const written = await saveFileStream(file.id, req.body);
+      if (written > maxFileSize) {
+        await prisma.file.delete({ where: { id: file.id } }).catch(() => {});
+        await deleteFileBytes(file.id);
+        throw new ApiError(
+          413,
+          `"${name}" is too large (max ${user.maxUploadMb} MB).`,
+        );
+      }
+      const updated = await prisma.file.update({
+        where: { id: file.id },
+        data: { size: BigInt(written) },
+        select: fileSelect,
+      });
+      return { files: [publicFile(updated)] };
+    } catch (err) {
+      await prisma.file.delete({ where: { id: file.id } }).catch(() => {});
+      await deleteFileBytes(file.id).catch(() => {});
+      throw err;
+    }
   });
 }

@@ -29,3 +29,15 @@ export class ApiError extends Error {
     this.status = status;
   }
 }
+
+/** Normalize a JSON body field into a deduped list of non-empty string ids. */
+export function asIdList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [
+    ...new Set(
+      value
+        .map((v) => String(v ?? "").trim())
+        .filter((id) => id.length > 0),
+    ),
+  ];
+}

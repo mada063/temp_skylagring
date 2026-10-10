@@ -34,6 +34,7 @@ import { categorize, formatBytes } from "@/lib/fileType";
 import {
   DEFAULT_UPLOAD_CONCURRENCY,
   DEFAULT_SCAN_CONCURRENCY,
+  mapPoolBySize,
 } from "@/lib/uploadLimit";
 
 type Folder = { id: string; name: string; parentId: string | null };
@@ -501,6 +502,27 @@ export default function DriveExplorer({
     }
   }
 
+  const uploadOne = useCallback(
+    async (
+      jobId: string,
+      file: File,
+      dest: string,
+      relPath: string,
+    ) => {
+      const qs = new URLSearchParams({ folderId: dest });
+      if (relPath) qs.set("path", relPath);
+      await uploadApi.upload(jobId, `/api/files?${qs}`, file, {
+        label: file.name,
+        size: file.size,
+        headers: {
+          "Content-Type": file.type || "application/octet-stream",
+          "X-File-Name": encodeURIComponent(file.name),
+        },
+      });
+    },
+    [uploadApi],
+  );
+
   const uploadFiles = useCallback(
     async (fileList: FileList | File[], folderId: string) => {
       const files = Array.from(fileList);
@@ -510,21 +532,20 @@ export default function DriveExplorer({
 
       const jobId = uploadApi.beginJob();
       uploadApi.startUploading(jobId, files.length);
-      await mapPool(files, concurrencyRef.current, async (f) => {
-        if (uploadApi.isCancelled(jobId)) return;
-        const form = new FormData();
-        form.set("folderId", dest);
-        form.append("file", f);
-        try {
-          await uploadApi.upload(jobId, "/api/files", form, {
-            label: f.name,
-            size: f.size,
-          });
-        } catch (err) {
-          if (err instanceof UploadCancelledError) return;
-          /* surfaced in the upload toast */
-        }
-      });
+      await mapPoolBySize(
+        files,
+        concurrencyRef.current,
+        (f) => f.size,
+        async (f) => {
+          if (uploadApi.isCancelled(jobId)) return;
+          try {
+            await uploadOne(jobId, f, dest, "");
+          } catch (err) {
+            if (err instanceof UploadCancelledError) return;
+            /* surfaced in the upload toast */
+          }
+        },
+      );
       if (uploadApi.isCancelled(jobId)) {
         await loadFiles(folderId);
         await reload();
@@ -534,7 +555,7 @@ export default function DriveExplorer({
       await loadFiles(folderId);
       await reload();
     },
-    [uploadApi, loadFiles, reload],
+    [uploadApi, uploadOne, loadFiles, reload],
   );
 
   // Upload dropped entries, which may include folders (whose structure is
@@ -600,22 +621,20 @@ export default function DriveExplorer({
       }
 
       uploadApi.startUploading(jobId, collected.length);
-      await mapPool(collected, concurrencyRef.current, async (item) => {
-        if (uploadApi.isCancelled(jobId)) return;
-        const form = new FormData();
-        form.set("folderId", dest);
-        form.append("file", item.file);
-        form.append("path", item.dir);
-        try {
-          await uploadApi.upload(jobId, "/api/files", form, {
-            label: item.file.name,
-            size: item.file.size,
-          });
-        } catch (err) {
-          if (err instanceof UploadCancelledError) return;
-          /* surfaced in the upload toast */
-        }
-      });
+      await mapPoolBySize(
+        collected,
+        concurrencyRef.current,
+        (item) => item.file.size,
+        async (item) => {
+          if (uploadApi.isCancelled(jobId)) return;
+          try {
+            await uploadOne(jobId, item.file, dest, item.dir);
+          } catch (err) {
+            if (err instanceof UploadCancelledError) return;
+            /* surfaced in the upload toast */
+          }
+        },
+      );
       if (uploadApi.isCancelled(jobId)) {
         await loadFiles(folderId);
         await reload();
@@ -625,7 +644,7 @@ export default function DriveExplorer({
       await loadFiles(folderId);
       await reload();
     },
-    [uploadApi, loadFiles, reload],
+    [uploadApi, uploadOne, loadFiles, reload],
   );
 
  const moveItem = useCallback(

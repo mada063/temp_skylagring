@@ -64,8 +64,8 @@ type UploadApi = {
   upload: (
     jobId: string,
     url: string,
-    form: FormData,
-    meta: { label: string; size: number },
+    body: XMLHttpRequestBodyInit,
+    meta: { label: string; size: number; headers?: Record<string, string> },
   ) => Promise<UploadResult>;
   finishJob: (jobId: string) => void;
   failJob: (jobId: string, message: string) => void;
@@ -270,8 +270,8 @@ export default function UploadProvider({
     (
       jobId: string,
       url: string,
-      form: FormData,
-      meta: { label: string; size: number },
+      body: XMLHttpRequestBodyInit,
+      meta: { label: string; size: number; headers?: Record<string, string> },
     ) => {
       if (cancelled.current.has(jobId)) {
         return Promise.reject(new UploadCancelledError());
@@ -308,6 +308,11 @@ export default function UploadProvider({
         };
 
         xhr.open("POST", url);
+        if (meta.headers) {
+          for (const [key, value] of Object.entries(meta.headers)) {
+            xhr.setRequestHeader(key, value);
+          }
+        }
         xhr.upload.onprogress = (e) => {
           if (!e.lengthComputable || cancelled.current.has(jobId)) return;
           const key = `${jobId}:${fileId}`;
@@ -383,7 +388,7 @@ export default function UploadProvider({
           }));
           reject(new UploadCancelledError());
         };
-        xhr.send(form);
+        xhr.send(body);
       });
     },
     [patchJob],

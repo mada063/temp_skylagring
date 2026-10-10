@@ -1,7 +1,9 @@
 import fs from "fs/promises";
 import path from "path";
-import { createReadStream } from "fs";
+import { createReadStream, createWriteStream } from "fs";
 import { Readable } from "stream";
+import { pipeline } from "stream/promises";
+import { randomBytes } from "crypto";
 
 const UPLOAD_DIR = path.join(process.cwd(), "uploads");
 const THUMB_DIR = path.join(UPLOAD_DIR, "thumbs");
@@ -17,6 +19,32 @@ export function thumbPath(fileId: string): string {
 export async function saveFileBytes(fileId: string, bytes: Buffer): Promise<void> {
   await fs.mkdir(UPLOAD_DIR, { recursive: true });
   await fs.writeFile(diskPath(fileId), bytes);
+}
+
+/**
+ * Stream a web ReadableStream straight to disk (constant memory).
+ * Returns bytes written. Uses a temp name then renames to `fileId`.
+ */
+export async function saveFileStream(
+  fileId: string,
+  webStream: ReadableStream<Uint8Array>,
+): Promise<number> {
+  await fs.mkdir(UPLOAD_DIR, { recursive: true });
+  const tmpId = `tmp_${randomBytes(16).toString("hex")}`;
+  const tmp = diskPath(tmpId);
+  const dest = diskPath(fileId);
+  try {
+    const nodeStream = Readable.fromWeb(
+      webStream as import("stream/web").ReadableStream,
+    );
+    await pipeline(nodeStream, createWriteStream(tmp));
+    const { size } = await fs.stat(tmp);
+    await fs.rename(tmp, dest);
+    return size;
+  } catch (err) {
+    await fs.unlink(tmp).catch(() => {});
+    throw err;
+  }
 }
 
 /** Duplicate on-disk bytes from one file id to another. */

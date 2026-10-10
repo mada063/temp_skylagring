@@ -1,5 +1,5 @@
 import { requireUser } from "@/lib/auth";
-import { ApiError, handle } from "@/lib/api";
+import { ApiError, asIdList, handle } from "@/lib/api";
 import { copyItems } from "@/lib/copy";
 
 export const runtime = "nodejs";
@@ -8,14 +8,14 @@ export const dynamic = "force-dynamic";
 export async function POST(req: Request) {
   return handle(async () => {
     const user = await requireUser();
-    const body = await req.json().catch(() => ({}));
+    const body = (await req.json().catch(() => ({}))) as {
+      fileIds?: unknown;
+      folderIds?: unknown;
+      folderId?: unknown;
+    };
 
-    const fileIds = Array.isArray(body.fileIds)
-      ? [...new Set(body.fileIds.map(String))].filter(Boolean)
-      : [];
-    const folderIds = Array.isArray(body.folderIds)
-      ? [...new Set(body.folderIds.map(String))].filter(Boolean)
-      : [];
+    const fileIds = asIdList(body.fileIds);
+    const folderIds = asIdList(body.folderIds);
     const destParam = body.folderId;
     const destFolderId =
       destParam && destParam !== "root" ? String(destParam) : null;

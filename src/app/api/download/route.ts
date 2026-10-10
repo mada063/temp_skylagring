@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import { requireUser } from "@/lib/auth";
+import { asIdList } from "@/lib/api";
 import { getDescendantIds } from "@/lib/trash";
 import {
   appendStoredFile,
@@ -41,13 +42,12 @@ export async function POST(req: Request) {
     return new Response("Unauthorized", { status: 401 });
   }
 
-  const body = await req.json().catch(() => ({}));
-  const fileIds = Array.isArray(body.fileIds)
-    ? [...new Set(body.fileIds.map(String))].filter(Boolean)
-    : [];
-  const folderIds = Array.isArray(body.folderIds)
-    ? [...new Set(body.folderIds.map(String))].filter(Boolean)
-    : [];
+  const body = (await req.json().catch(() => ({}))) as {
+    fileIds?: unknown;
+    folderIds?: unknown;
+  };
+  const fileIds = asIdList(body.fileIds);
+  const folderIds = asIdList(body.folderIds);
 
   if (fileIds.length === 0 && folderIds.length === 0) {
     return new Response("Nothing to download", { status: 400 });
