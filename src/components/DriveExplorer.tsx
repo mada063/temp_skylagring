@@ -23,6 +23,7 @@ import {
 } from "lucide-react";
 import clsx from "clsx";
 import FileIcon from "@/components/FileIcon";
+import LazyThumb from "@/components/LazyThumb";
 import ContextMenu, { type MenuItem } from "@/components/ContextMenu";
 import { useUploader, UploadCancelledError } from "@/components/UploadProvider";
 import LassoSurface, {
@@ -1994,7 +1995,7 @@ function FolderCard({
  onDragLeave={onDragLeaveTarget}
  title={`${folder.name} · double-click to open`}
  className={clsx(
- "group flex flex-col overflow-hidden border border-border bg-surface text-left transition-colors hover:border-accent/60",
+ "group flex flex-col overflow-hidden border border-border bg-surface text-left transition-colors [content-visibility:auto] [contain-intrinsic-size:auto_160px] hover:border-accent/60",
  itemSelected && "border-accent bg-accent/10",
  isDropTarget && "border-accent outline outline-2 outline-accent",
  )}
@@ -2042,18 +2043,16 @@ function FileCard({
  onContextMenu={onContextMenu}
  title={`${file.name} · double-click to open`}
  className={clsx(
- "group flex flex-col overflow-hidden border border-border bg-surface text-left transition-colors hover:border-accent/60",
+ "group flex flex-col overflow-hidden border border-border bg-surface text-left transition-colors [content-visibility:auto] [contain-intrinsic-size:auto_160px] hover:border-accent/60",
  itemSelected && "border-accent bg-accent/10",
  )}
  >
  <div className="flex h-28 items-center justify-center overflow-hidden bg-elevated/40">
  {isImage ? (
- // eslint-disable-next-line @next/next/no-img-element
- <img
- src={`/api/files/${file.id}/download?inline=1`}
- alt={file.name}
- loading="lazy"
- className="h-full w-full object-cover"
+ <LazyThumb
+ fileId={file.id}
+ name={file.name}
+ mimeType={file.mimeType}
  />
  ) : (
  <FileIcon

@@ -5,10 +5,12 @@ import { Columns2, Rows2 } from "lucide-react";
 import clsx from "clsx";
 import DriveExplorer from "@/components/DriveExplorer";
 import Splitter from "@/components/Splitter";
+import { useSearchQuery } from "@/components/SearchQueryContext";
 
 // Hosts one or more independent copies of the drive tree. The user can split
 // the workspace left/right and/or top/bottom, and drag the dividers to resize.
-export default function DriveWorkspace({ query }: { query?: string }) {
+export default function DriveWorkspace() {
+  const query = useSearchQuery();
   const [vSplit, setVSplit] = useState(false); // left / right
   const [hSplit, setHSplit] = useState(false); // top / bottom
   const [colFrac, setColFrac] = useState(50);
@@ -36,7 +38,7 @@ export default function DriveWorkspace({ query }: { query?: string }) {
   // Only the very first pane carries the split controls and the search query.
   const pane = (primary: boolean) => (
     <DriveExplorer
-      query={primary ? query : undefined}
+      query={primary && query ? query : undefined}
       headerActions={primary ? controls : undefined}
     />
   );

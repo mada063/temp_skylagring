@@ -14,6 +14,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { formatBytes } from "@/lib/fileType";
+import { SearchQueryContext } from "@/components/SearchQueryContext";
 
 // The storage meter fills over each 1 GB. When a lap completes, that color
 // becomes the track background and the next color fills on top of it.
@@ -67,12 +68,18 @@ export default function AppShell({
  null,
  );
  const searchRef = useRef<HTMLInputElement>(null);
+ // Debounced query exposed to the drive — keeps typing responsive without
+ // waiting on URL navigation, and avoids blurring the input on each fetch.
+ const [driveQuery, setDriveQuery] = useState(
+ () => (params.get("q") ?? "").trim(),
+ );
 
  useEffect(() => {
- // Don't overwrite while the user is typing; only sync from the URL
- // (back/forward, or after a replace we ourselves triggered).
+ // Sync from the URL on back/forward only — never while the user is typing.
  if (document.activeElement === searchRef.current) return;
- setQuery(params.get("q") ?? "");
+ const q = params.get("q") ?? "";
+ setQuery(q);
+ setDriveQuery(q.trim());
  }, [params]);
 
  const loadUsage = useCallback(() => {
@@ -95,32 +102,46 @@ export default function AppShell({
  return () => window.removeEventListener("sky:refresh", onRefresh);
  }, [loadUsage]);
 
+ /** Update the address bar without a Next.js navigation (preserves input focus). */
+ function syncUrlQuietly(q: string) {
+ const url = q ? `/drive?q=${encodeURIComponent(q)}` : "/drive";
+ const current = `${window.location.pathname}${window.location.search}`;
+ if (current === url) return;
+ window.history.replaceState(window.history.state, "", url);
+ }
+
  function submitSearch(e: React.FormEvent) {
  e.preventDefault();
  const q = query.trim();
+ setDriveQuery(q);
+ if (pathname.startsWith("/drive")) {
+ syncUrlQuietly(q);
+ } else {
  router.replace(q ? `/drive?q=${encodeURIComponent(q)}` : "/drive");
  }
+ }
 
- // Search as you type (debounced).
+ // Search as you type (debounced). Prefer a quiet history update on /drive so
+ // the shell (and search input) are not remounted by App Router navigation.
  useEffect(() => {
  const q = query.trim();
- const current = (params.get("q") ?? "").trim();
- if (q === current) return;
-
  const t = setTimeout(() => {
- if (!q) {
- if (pathname.startsWith("/drive") && current) {
- router.replace("/drive");
- }
+ setDriveQuery(q);
+
+ if (!pathname.startsWith("/drive")) {
+ if (!q) return;
+ router.replace(`/drive?q=${encodeURIComponent(q)}`);
  return;
  }
- router.replace(`/drive?q=${encodeURIComponent(q)}`);
+
+ syncUrlQuietly(q);
  }, 250);
 
  return () => clearTimeout(t);
- }, [query, params, pathname, router]);
+ }, [query, pathname, router]);
 
  return (
+ <SearchQueryContext.Provider value={driveQuery}>
  <div className="flex h-screen flex-col overflow-hidden bg-bg text-fg">
  {/* Header */}
  <header className="flex h-14 shrink-0 items-center gap-4 border-b border-border px-5">
@@ -151,6 +172,7 @@ export default function AppShell({
 
  <main className="min-h-0 flex-1 overflow-hidden">{children}</main>
  </div>
+ </SearchQueryContext.Provider>
  );
 }
 
