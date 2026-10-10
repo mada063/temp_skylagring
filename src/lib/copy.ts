@@ -112,7 +112,7 @@ async function copyOneFolder(
 
   // Never paste a folder into itself or a descendant.
   const tree = await getDescendantIds(userId, source.id);
-  if (destParentId && tree.has(destParentId)) {
+  if (destParentId && tree.includes(destParentId)) {
     throw new Error(
       `Cannot paste "${source.name}" into itself or a subfolder.`,
     );
